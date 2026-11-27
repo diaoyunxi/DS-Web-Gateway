@@ -19,6 +19,7 @@ import logging
 import time
 import uuid
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -35,6 +36,7 @@ from common.schemas import (
     ToolCallNotify,
     ToolResultMessage,
 )
+from gateway.image_guard import assert_public_image_url
 from gateway.render import extract_images, render_full, render_incremental, trailing_tool_results
 from gateway.ws_client import get_ws_client
 
@@ -77,14 +79,28 @@ def verify_api_key(request: Request) -> None:
 # ---------------------------------------------------------------- 图片代下载
 
 async def _to_data_uri(url: str) -> str | None:
-    """http(s) 图片代下载转 base64 data URI；data URI 原样返回。"""
+    """http(s) 图片代下载转 base64 data URI；data URI 原样返回。
+
+    URL 完全由调用方 messages 提供，等价于服务端发起任意 GET，因此：
+    - 目标主机必须解析到公网地址（SSRF 到内网/元数据服务会被拒绝）；
+    - 不自动跟随重定向，逐跳校验 Location 仍为公网地址。
+    """
     if url.startswith("data:"):
         return url
     if not url.startswith(("http://", "https://")):
         return None
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(url, timeout=_IMAGE_DOWNLOAD_TIMEOUT)
+        assert_public_image_url(url)
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            for _ in range(4):
+                resp = await client.get(url, timeout=_IMAGE_DOWNLOAD_TIMEOUT)
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                    url = urljoin(url, resp.headers["location"])
+                    assert_public_image_url(url)
+                    continue
+                break
+            else:
+                raise ValueError("图片下载重定向次数过多")
             resp.raise_for_status()
             content = resp.content
             if len(content) > _MAX_IMAGE_DOWNLOAD:

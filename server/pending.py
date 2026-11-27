@@ -40,13 +40,25 @@ class PendingCallRegistry:
         raw = f"{code}|{name}|{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def _drop(self, call: PendingCall) -> None:
+        self._calls.pop(call.call_id, None)
+        if self._by_hash.get(call.arg_hash) == call.call_id:
+            self._by_hash.pop(call.arg_hash, None)
+
     async def register(self, code: str, name: str, arguments: dict) -> tuple[PendingCall, bool]:
-        """登记工具调用；返回 (call, 是否首次登记)。重复抓取返回同一 call。"""
+        """登记工具调用；返回 (call, 是否首次登记)。重复抓取返回同一 call。
+
+        已消费的旧条目不再复用：否则模型重试同一工具调用时会拿到已消费的
+        call_id，/result 永远返回"已被消费"而无法继续。
+        """
         arg_hash = self._hash(code, name, arguments)
         async with self._lock:
             existing_id = self._by_hash.get(arg_hash)
-            if existing_id is not None and existing_id in self._calls:
-                return self._calls[existing_id], False
+            existing = self._calls.get(existing_id) if existing_id else None
+            if existing is not None and not existing.consumed:
+                return existing, False
+            if existing is not None:
+                self._drop(existing)
             call_id = "call_" + secrets.token_urlsafe(9)
             call = PendingCall(
                 call_id=call_id,
@@ -94,15 +106,15 @@ class PendingCallRegistry:
             return call.result
 
     def sweep(self) -> int:
+        """清理所有过期条目（含结果已就绪但从未被取走的），同步清理去重索引。"""
         now = time.time()
         expired = [
-            cid
-            for cid, call in self._calls.items()
-            if now - call.created_at > self._ttl and not call.event.is_set()
+            call
+            for call in self._calls.values()
+            if now - call.created_at > self._ttl
         ]
-        for cid in expired:
-            call = self._calls.pop(cid)
-            self._by_hash.pop(call.arg_hash, None)
+        for call in expired:
+            self._drop(call)
         return len(expired)
 
     def stats(self) -> dict:

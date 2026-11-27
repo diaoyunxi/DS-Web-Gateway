@@ -71,10 +71,10 @@ def test_shard_buffer_total_change_restarts_group():
         # total 变化 → 开启新组（此前分片作废）
         assert await buf.add("c1", AnswerEnvelope(content="乙", seq=2, total=3)) is None
         assert await buf.progress("c1") == (1, 3)
-        # 同一 total 下重复 seq=1 → 重启新组
+        # seq=1 晚到：按文档做乱序补齐，不重启分组
         await buf.add("c1", AnswerEnvelope(content="丙", seq=3, total=3))
-        assert await buf.add("c1", AnswerEnvelope(content="新一组", seq=1, total=3)) is None
-        assert await buf.progress("c1") == (1, 3)
+        assert await buf.add("c1", AnswerEnvelope(content="第一段", seq=1, total=3)) == "第一段乙丙"
+        assert await buf.progress("c1") == (0, 0)
 
     run(scenario())
 
@@ -88,6 +88,19 @@ def test_shard_buffer_sweep_and_stats():
 
     run(scenario())
     assert ShardBuffer(42).stats() == {"codes": 0, "ttl": 42}
+
+
+def test_shard_buffer_repeated_seq1_keeps_other_parts():
+    async def scenario():
+        buf = ShardBuffer(60)
+        await buf.add("c1", AnswerEnvelope(content="甲", seq=1, total=3))
+        await buf.add("c1", AnswerEnvelope(content="乙", seq=2, total=3))
+        # 抓取器重试 seq=1：覆盖内容，但不得丢弃已收到的 seq=2
+        assert await buf.add("c1", AnswerEnvelope(content="甲-新", seq=1, total=3)) is None
+        assert await buf.progress("c1") == (2, 3)
+        assert await buf.add("c1", AnswerEnvelope(content="丙", seq=3, total=3)) == "甲-新乙丙"
+
+    run(scenario())
 
 
 # ---------------------------------------------------------------- PendingCallRegistry
@@ -139,6 +152,33 @@ def test_pending_sweep_and_stats():
         assert reg.sweep() == 1
         assert reg.get(call.call_id) is None
         assert await reg.register("c1", "t2", {}) is not None
+
+    run(scenario())
+
+
+def test_pending_sweep_removes_ready_calls_and_hash():
+    async def scenario():
+        reg = PendingCallRegistry(ttl=0)
+        call, _ = await reg.register("c1", "t", {})
+        await reg.set_result(call.call_id, "r")
+        # 结果已就绪但从未被取走，也必须过期清理
+        assert reg.sweep() == 1
+        assert reg.get(call.call_id) is None
+        again, is_new = await reg.register("c1", "t", {})
+        assert is_new and again.call_id != call.call_id
+
+    run(scenario())
+
+
+def test_pending_register_after_consumed_returns_new_call():
+    async def scenario():
+        reg = PendingCallRegistry(60)
+        call, _ = await reg.register("c1", "t", {})
+        await reg.set_result(call.call_id, "r")
+        assert await reg.consume(call.call_id) == "r"
+        # 模型重试同一工具调用时不能拿到已消费的 call_id
+        again, is_new = await reg.register("c1", "t", {})
+        assert is_new and again.call_id != call.call_id
 
     run(scenario())
 
