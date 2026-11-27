@@ -3,7 +3,8 @@
 规则（见方案 §3.2）：
 - 单条 content ≤ answer_shard_max_chars，超长必须分片（seq/total）；
 - ①做乱序/去重/重组，缓冲 TTL 5 分钟；
-- 同一 code 收到 seq=1 视为开启新的一组（支持连续多个 answer）。
+- 一组重组完成后立即删除分组；下一次 seq=1 自然开启新的一组
+  （支持同一 code 连续多个 answer）。
 """
 from __future__ import annotations
 
@@ -22,16 +23,14 @@ class ShardBuffer:
     async def add(self, code: str, env: AnswerEnvelope) -> str | None:
         """加入一片；返回完整内容（已重组）或 None（尚缺分片）。
 
-        乱序容错：seq=1 晚到时（此前已收到其它分片）不重启分组；
-        仅当分组已含 seq=1（重复开启）或 total 变化时才开启新组。
+        乱序容错：seq=1 晚到时直接补齐，不重启分组；
+        重复抓取同一 seq（含 seq=1）按覆盖去重处理，也不重启分组，
+        避免已收到的其它分片被丢弃。仅当分组不存在、total 变化，
+        或上一组已完成（分组已删除）时才开启新组。
         """
         async with self._lock:
             group = self._groups.get(code)
-            restart = (
-                group is None
-                or group["total"] != env.total
-                or (env.seq == 1 and 1 in group["parts"])
-            )
+            restart = group is None or group["total"] != env.total
             if restart:
                 group = {"total": env.total, "parts": {}, "expire": time.time() + self._ttl}
                 self._groups[code] = group
